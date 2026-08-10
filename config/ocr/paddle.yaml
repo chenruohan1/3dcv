@@ -5,7 +5,13 @@ ocr:
   use_gpu: false               # 使用 CPU 推理（onnxruntime）
   # 模板模糊匹配参数（模板文本定义在 class_registry.ocr_templates）
   enlarge: 1.0                 # 裁剪图放大倍数（>1 时先放大再 OCR）
-  min_match_score: 0.0         # rapidfuzz 相似度阈值，超过才认定命中
+  min_match_score: 60.0        # rapidfuzz 相似度达到该阈值才认定命中
+  min_text_length: 2           # 至少识别到两个字符，避免单字偶然命中模板
+  # 未检出 Book 等候选框时，使用定位后的 Table 框做兜底 OCR。
+  fallback_when_no_candidate: true
+  fallback_candidate_class: Table
+  full_frame_if_no_table: false # Table 也不存在时不扫描桌外区域
+  fallback_mask_known_classes: true # 兜底时遮蔽已检出的普通物品，避免包装文字误分类
   # PaddleOCR ONNX 引擎参数
   engine:
     backend: auto                # auto: 香橙派用 acl(.om)，其它平台用 onnx(.onnx)
