@@ -11,7 +11,7 @@ from pathlib import Path
 
 import cv2
 
-from core.components.detector.yolo.factory import build_yolo_detector
+from core.components.detector.builder import build_detector
 from core.components.ocr.paddle_ocr import PaddleOcr
 from core.config_loader import load_config
 from core.types import Detection, Frame
@@ -101,7 +101,11 @@ def main() -> int:
         }
     )
 
-    detector = build_yolo_detector(detector_config, config["class_registry"])
+    detector = build_detector(
+        detector_config,
+        "ocr_strategy_audit",
+        config["class_registry"],
+    )
     ocr = PaddleOcr(config["ocr"], config["class_registry"])
 
     counters = Counter()
