@@ -131,6 +131,8 @@ def main() -> int:
         "masked_detection_classes",
         "text",
         "text_length",
+        "rotation",
+        "ocr_confidence",
         "predicted_class",
         "match_score",
         "accepted",
@@ -238,16 +240,19 @@ def main() -> int:
                             bbox,
                         )
                         ocr_started = time.perf_counter()
-                        text = ocr._read_text(
+                        (
+                            text,
+                            predicted_class,
+                            match_score,
+                            rotation,
+                            ocr_confidence,
+                        ) = ocr._read_and_classify(
                             rgb,
                             bbox,
                             mask_bboxes=[detection.bbox for detection in masked],
                         )
                         ocr_ms = (time.perf_counter() - ocr_started) * 1000.0
                         ocr_times.append(ocr_ms)
-                        predicted_class, match_score = (
-                            ocr._classify(text) if text else (None, 0.0)
-                        )
                         accepted = predicted_class is not None
 
                         counters["targets"] += 1
@@ -280,6 +285,8 @@ def main() -> int:
                                 ),
                                 "text": text,
                                 "text_length": len(text),
+                                "rotation": rotation,
+                                "ocr_confidence": f"{ocr_confidence:.6f}",
                                 "predicted_class": predicted_class or "",
                                 "match_score": f"{match_score:.6f}",
                                 "accepted": accepted,

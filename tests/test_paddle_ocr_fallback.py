@@ -9,15 +9,24 @@ from core.types import Detection, Frame
 
 
 class _FakeOcrEngine:
-    def __init__(self, text: str = "高等数学"):
+    def __init__(self, text: str = "高等数学", responses=None):
         self.text = text
+        self.responses = list(responses) if responses is not None else None
         self.crop_shapes = []
         self.crops = []
 
     def __call__(self, crop):
         self.crop_shapes.append(crop.shape)
         self.crops.append(crop.copy())
-        return [], [(self.text, 0.99)]
+        if self.responses is None:
+            response = self.text
+        else:
+            response = self.responses[len(self.crops) - 1]
+        if response is None:
+            return [], []
+        if isinstance(response, str):
+            return [], [(response, 0.99)]
+        return [], response
 
 
 def _build_ocr(*, fallback: bool = True, full_frame: bool = False) -> PaddleOcr:
@@ -25,15 +34,17 @@ def _build_ocr(*, fallback: bool = True, full_frame: bool = False) -> PaddleOcr:
     ocr._engine = _FakeOcrEngine()
     ocr.candidate_classes = {"Book"}
     ocr.output_classes = ["W001", "W002", "W003", "W004"]
-    ocr.templates = [
-        "怪兽",
-        "语文阅读写作诵读经典国语作文三字经论语诗词弟子规古诗文言文散文",
-        "高等数学线性代数函数立体几何概率方程算术口算",
-        "自然物理化学科学地理生物生态环境节气",
+    ocr.template_keywords = [
+        ["怪兽"],
+        ["语文", "阅读", "写作", "国语", "作文"],
+        ["数学", "高等数学", "线性代数", "函数", "几何"],
+        ["自然", "物理", "化学", "科学", "地理", "生物"],
     ]
     ocr.enlarge = 1.0
-    ocr.min_match_score = 60.0
+    ocr.min_match_score = 80.0
+    ocr.min_match_margin = 15.0
     ocr.min_text_length = 2
+    ocr.retry_rotations = (90, 270)
     ocr.fallback_when_no_candidate = fallback
     ocr.fallback_candidate_class = "Table"
     ocr.full_frame_if_no_table = full_frame
@@ -69,18 +80,56 @@ def _frame() -> Frame:
 
 
 class PaddleOcrFallbackTest(unittest.TestCase):
-    def test_two_character_keyword_is_accepted_at_threshold(self):
+    def test_exact_two_character_keyword_is_accepted(self):
         ocr = _build_ocr()
 
         class_name, score = ocr._classify("语文")
 
         self.assertEqual("W002", class_name)
-        self.assertEqual(60.0, score)
+        self.assertEqual(100.0, score)
 
     def test_single_character_is_rejected(self):
         ocr = _build_ocr()
 
         self.assertEqual((None, 0.0), ocr._classify("语"))
+
+    def test_ambiguous_fuzzy_match_is_rejected(self):
+        ocr = _build_ocr()
+        ocr.output_classes = ["W002", "W005"]
+        ocr.template_keywords = [["语文"], ["英语"]]
+        ocr.min_match_score = 40.0
+
+        self.assertEqual((None, 0.0), ocr._classify("语学"))
+
+    def test_keyword_inside_noisy_text_is_accepted(self):
+        ocr = _build_ocr()
+
+        self.assertEqual(("W003", 100.0), ocr._classify("2数学5"))
+
+    def test_failed_original_orientation_retries_90_and_270_degrees(self):
+        ocr = _build_ocr()
+        ocr._engine = _FakeOcrEngine(responses=["学数", None, "数学"])
+        detections = [
+            Detection(class_name="Book", bbox=(20, 10, 80, 50), score=0.8),
+        ]
+
+        results = ocr.process(_frame(), detections, table=1)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("W003", results[0].class_name)
+        self.assertEqual("数学", results[0].evidence["text"])
+        self.assertEqual(270, results[0].evidence["rotation"])
+        self.assertEqual([(40, 60, 3), (60, 40, 3), (60, 40, 3)], ocr._engine.crop_shapes)
+
+    def test_single_character_is_not_guessed_after_rotation_retries(self):
+        ocr = _build_ocr()
+        ocr._engine = _FakeOcrEngine(responses=["语", "语", "语"])
+        detections = [
+            Detection(class_name="Book", bbox=(20, 10, 80, 50), score=0.8),
+        ]
+
+        self.assertEqual([], ocr.process(_frame(), detections, table=1))
+        self.assertEqual(3, len(ocr._engine.crops))
 
     def test_book_crop_takes_priority_over_table_fallback(self):
         ocr = _build_ocr()
