@@ -2,15 +2,15 @@
 
 对应旧项目（3dcv_2025）的 OCRBookCropDetector，适配到当前框架的 BaseOcr 接口：
 优先对上游检出的候选框（默认为 ``Book``）逐个裁剪；没有候选框时可回退到
-``Table`` 框。裁剪区域送入 PaddleOCR 引擎后拼接识别文本，再与配置的类别关键词
-逐项匹配；原方向分类失败时尝试 90/270 度旋转，命中则产出对应的书本物品名称检测项。
+``Table`` 框。裁剪区域送入 PaddleOCR 引擎后拼接识别文本，再用 rapidfuzz 与
+配置的模板串做模糊匹配，命中则产出对应的书本物品名称检测项。
 """
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
 import cv2
-from rapidfuzz import fuzz
+from rapidfuzz import process
 
 from core.components.ocr.base import BaseOcr
 from core.components.ocr.paddleocr import ONNXPaddleOcr
@@ -51,26 +51,13 @@ class PaddleOcr(BaseOcr):
                 "class_registry.ocr_templates must define every OCR output class: "
                 + ", ".join(missing_templates)
             )
-        self.template_keywords = [
-            self._parse_template_keywords(ocr_templates[class_name], class_name)
-            for class_name in self.output_classes
-        ]
+        self.templates = [str(ocr_templates[class_name]) for class_name in self.output_classes]
 
         self.enlarge = float(config.get("enlarge", 1.0))
         self.min_match_score = float(config.get("min_match_score", 0.0))
-        self.min_match_margin = float(config.get("min_match_margin", 0.0))
         self.min_text_length = int(config.get("min_text_length", 2))
         if self.min_text_length < 1:
             raise ValueError("ocr.min_text_length must be at least 1")
-        retry_rotations = config.get("retry_rotations", [90, 270])
-        self.retry_rotations = tuple(dict.fromkeys(int(value) for value in retry_rotations))
-        invalid_rotations = [
-            value for value in self.retry_rotations if value not in {90, 180, 270}
-        ]
-        if invalid_rotations:
-            raise ValueError(
-                "ocr.retry_rotations only supports 90, 180 and 270 degrees"
-            )
         self.fallback_when_no_candidate = bool(
             config.get("fallback_when_no_candidate", False)
         )
@@ -110,15 +97,15 @@ class PaddleOcr(BaseOcr):
                 ocr_mode,
                 bbox,
             )
-            text, class_name, score, rotation, ocr_confidence = (
-                self._read_and_classify(
-                    frame.rgb,
-                    bbox,
-                    mask_bboxes=[
-                        detection.bbox for detection in masked_detections
-                    ],
-                )
+            text = self._read_text(
+                frame.rgb,
+                bbox,
+                mask_bboxes=[detection.bbox for detection in masked_detections],
             )
+            if not text:
+                continue
+
+            class_name, score = self._classify(text)
             if class_name is None:
                 continue
 
@@ -137,8 +124,6 @@ class PaddleOcr(BaseOcr):
                         ),
                         "table": table,
                         "text": text,
-                        "rotation": rotation,
-                        "ocr_confidence": ocr_confidence,
                         "match_score": score,
                     },
                 )
@@ -222,26 +207,8 @@ class PaddleOcr(BaseOcr):
             masked.append(detection)
         return masked
 
-    @staticmethod
-    def _parse_template_keywords(value, class_name: str) -> List[str]:
-        """把类别模板统一为非空关键词列表，同时兼容旧版字符串配置。"""
-        if isinstance(value, str):
-            keywords = [value.strip()]
-        elif isinstance(value, (list, tuple)):
-            keywords = [str(item).strip() for item in value]
-        else:
-            raise ValueError(
-                f"class_registry.ocr_templates.{class_name} must be a string or list"
-            )
-        keywords = [keyword for keyword in keywords if keyword]
-        if not keywords:
-            raise ValueError(
-                f"class_registry.ocr_templates.{class_name} must not be empty"
-            )
-        return keywords
-
-    def _prepare_crop(self, rgb, bbox, mask_bboxes=()):
-        """裁剪并遮蔽 OCR 区域，供原方向和旋转重试复用。"""
+    def _read_text(self, rgb, bbox, mask_bboxes=()) -> str:
+        """裁剪 bbox 区域跑 OCR，把该区域内识别出的所有文本拼接成一个串。"""
         x1, y1, x2, y2 = (int(v) for v in bbox)
         height, width = rgb.shape[:2]
         x1 = max(0, min(x1, width))
@@ -250,7 +217,7 @@ class PaddleOcr(BaseOcr):
         y2 = max(0, min(y2, height))
         crop = rgb[y1:y2, x1:x2]
         if crop.size == 0:
-            return None
+            return ""
         if mask_bboxes:
             crop = crop.copy()
             for mask_bbox in mask_bboxes:
@@ -275,122 +242,21 @@ class PaddleOcr(BaseOcr):
                 fy=self.enlarge,
                 interpolation=cv2.INTER_LINEAR,
             )
-        return crop
 
-    @staticmethod
-    def _rotate_crop(crop, rotation: int):
-        if rotation == 0:
-            return crop
-        if rotation == 90:
-            return cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
-        if rotation == 180:
-            return cv2.rotate(crop, cv2.ROTATE_180)
-        if rotation == 270:
-            return cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        raise ValueError(f"unsupported OCR rotation: {rotation}")
-
-    def _recognize_crop(self, crop, rotation: int = 0) -> Tuple[str, float]:
-        """识别一个已准备好的裁剪图，返回拼接文本和按字符加权置信度。"""
-        rotated = self._rotate_crop(crop, rotation)
-        _boxes, rec_res = self._engine(rotated)
+        _boxes, rec_res = self._engine(crop)
         if not rec_res:
-            return "", 0.0
-
-        parts = [
-            (str(text).strip(), float(score))
-            for text, score in rec_res
-            if str(text).strip()
-        ]
-        if not parts:
-            return "", 0.0
-        total_length = sum(len(text) for text, _score in parts)
-        confidence = sum(len(text) * score for text, score in parts) / total_length
-        return "".join(text for text, _score in parts), float(confidence)
-
-    def _read_text(self, rgb, bbox, mask_bboxes=()) -> str:
-        """按原方向识别 bbox，保留供审计工具使用的兼容接口。"""
-        crop = self._prepare_crop(rgb, bbox, mask_bboxes)
-        if crop is None:
             return ""
-        text, _confidence = self._recognize_crop(crop)
-        return text
-
-    def _read_and_classify(self, rgb, bbox, mask_bboxes=()):
-        """原方向分类失败时尝试配置的旋转角度，并选择最可靠结果。"""
-        crop = self._prepare_crop(rgb, bbox, mask_bboxes)
-        if crop is None:
-            return "", None, 0.0, 0, 0.0
-
-        text, confidence = self._recognize_crop(crop, 0)
-        class_name, match_score = self._classify(text)
-        if class_name is not None:
-            return text, class_name, match_score, 0, confidence
-
-        best_raw = (text, confidence, 0)
-        accepted = []
-        for rotation in self.retry_rotations:
-            rotated_text, rotated_confidence = self._recognize_crop(crop, rotation)
-            if (rotated_confidence, len(rotated_text)) > (
-                best_raw[1],
-                len(best_raw[0]),
-            ):
-                best_raw = (rotated_text, rotated_confidence, rotation)
-
-            rotated_class, rotated_score = self._classify(rotated_text)
-            if rotated_class is not None:
-                accepted.append(
-                    (
-                        rotated_score,
-                        rotated_confidence,
-                        len(rotated_text),
-                        rotated_text,
-                        rotated_class,
-                        rotation,
-                    )
-                )
-
-        if not accepted:
-            raw_text, raw_confidence, raw_rotation = best_raw
-            return raw_text, None, 0.0, raw_rotation, raw_confidence
-
-        (
-            best_score,
-            best_confidence,
-            _text_length,
-            best_text,
-            best_class,
-            best_rotation,
-        ) = max(accepted)
-        return (
-            best_text,
-            best_class,
-            float(best_score),
-            best_rotation,
-            float(best_confidence),
-        )
+        return "".join(text for text, _score in rec_res)
 
     def _classify(self, text: str):
-        """按类别关键词匹配文本；分数不足或类别不明确时拒绝。"""
-        text = "".join(str(text).split())
+        """用 rapidfuzz 把识别文本模糊匹配到模板，返回 (类别名, 相似度) 或 (None, 0)。"""
+        text = str(text).strip()
         if len(text) < self.min_text_length:
             return None, 0.0
-
-        class_scores = []
-        for class_name, keywords in zip(self.output_classes, self.template_keywords):
-            score = max(
-                100.0 if keyword in text else float(fuzz.ratio(text, keyword))
-                for keyword in keywords
-            )
-            class_scores.append((score, class_name))
-
-        ranked = sorted(class_scores, reverse=True)
-        best_score, best_class = ranked[0]
-        second_score = ranked[1][0] if len(ranked) > 1 else 0.0
-        if best_score < self.min_match_score:
-            return None, 0.0
-        if best_score - second_score < self.min_match_margin:
-            return None, 0.0
-        return best_class, float(best_score)
+        _matched, score, index = process.extractOne(text, self.templates)
+        if score >= self.min_match_score:
+            return self.output_classes[index], float(score)
+        return None, 0.0
 
     def close(self) -> None:
         """释放 PaddleOCR det/rec/cls 后端资源。"""

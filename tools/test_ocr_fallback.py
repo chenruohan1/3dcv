@@ -119,23 +119,19 @@ def main() -> int:
                 mode,
                 bbox,
             )
-            text, class_name, match_score, rotation, ocr_confidence = (
-                ocr._read_and_classify(
-                    rgb,
-                    bbox,
-                    mask_bboxes=[detection.bbox for detection in masked],
-                )
+            text = ocr._read_text(
+                rgb,
+                bbox,
+                mask_bboxes=[detection.bbox for detection in masked],
             )
+            classification = ocr._classify(text) if text else None
             print(f"  mode={mode} source={source_class} bbox={bbox}")
             print(
                 "  masked="
                 + str([detection.class_name for detection in masked])
             )
             print(f"  text={text!r}")
-            print(
-                f"  classification={(class_name, match_score)} "
-                f"rotation={rotation} ocr_confidence={ocr_confidence:.4f}"
-            )
+            print(f"  classification={classification}")
 
         results = ocr.process(frame, ocr_detections, table=1)
         print("\nFinal OCR detections:")

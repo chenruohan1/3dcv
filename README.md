@@ -563,7 +563,7 @@ RGBD detector 额外配置：
 
 ### ocr 文字识别
 
-[config/ocr/paddle.yaml](config/ocr/paddle.yaml)。对应 [PaddleOcr](core/components/ocr/paddle_ocr.py)：底层是一份自迁移过来、自包含的 PaddleOCR v5 ONNX 引擎（[core/components/ocr/paddleocr/](core/components/ocr/paddleocr/)，纯 onnxruntime 推理，含 DB 文本检测 + 方向分类 + CTC 识别）。业务流程为：优先对上游检出的候选框（默认 `Book`）逐个裁剪；没有候选框时可回退到定位后的 `Table` 框 → OCR 识别文本 → 原方向分类失败时尝试 90/270 度旋转 → 与 `class_registry.ocr_templates` 的类别关键词逐项匹配 → 命中则产出对应书本物品名称的检测。
+[config/ocr/paddle.yaml](config/ocr/paddle.yaml)。对应 [PaddleOcr](core/components/ocr/paddle_ocr.py)：底层是一份自迁移过来、自包含的 PaddleOCR v5 ONNX 引擎（[core/components/ocr/paddleocr/](core/components/ocr/paddleocr/)，纯 onnxruntime 推理，含 DB 文本检测 + 方向分类 + CTC 识别）。业务流程为：优先对上游检出的候选框（默认 `Book`）逐个裁剪；没有候选框时可回退到定位后的 `Table` 框 → OCR 识别文本并拼接 → 用 `rapidfuzz` 与 `class_registry.ocr_templates` 的模板串模糊匹配 → 命中则产出对应书本物品名称的检测。
 
 候选类别、输出类别与模板文本都归属共享的 `class_registry`（`ocr_candidate_classes` / `ocr_output_classes` / `ocr_templates`），因此本文件只配置 OCR 实现参数与引擎参数。
 
@@ -573,10 +573,8 @@ RGBD detector 额外配置：
 | `use_angle_cls`   | `true`                | 是否启用文字方向(0/180)分类矫正                                            |
 | `use_gpu`         | `false`               | 是否用 GPU 推理（`false` 走 CPU onnxruntime）                          |
 | `enlarge`         | `1.0`                 | 裁剪图放大倍数；`>1` 时先放大再 OCR，有助于识别小字                                 |
-| `min_match_score` | `80.0`                | 与单个类别关键词的相似度阈值（0~100），达到才认定命中                          |
-| `min_match_margin` | `15.0`               | 最佳类别至少领先第二类别的分数；不足时按歧义结果拒绝                            |
+| `min_match_score` | `60.0`                | rapidfuzz 相似度阈值（0~100），达到才认定命中                                 |
 | `min_text_length` | `2`                   | 参与模板分类的最短文字长度，避免单个常见汉字偶然命中                           |
-| `retry_rotations` | `[90, 270]`           | 原方向分类失败后追加尝试的旋转角度；0/180 度仍由方向分类模型处理                 |
 | `fallback_when_no_candidate` | `true`     | 没有 `Book` 等 OCR 候选框时，是否使用兜底区域继续 OCR                         |
 | `fallback_candidate_class` | `Table`       | 作为兜底 OCR 区域的检测类别                                                   |
 | `full_frame_if_no_table` | `false`          | 兜底类别也不存在时是否扫描整帧；默认关闭以避免桌外文字干扰                     |
